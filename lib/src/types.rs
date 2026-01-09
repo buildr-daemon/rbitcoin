@@ -1,15 +1,20 @@
+use crate::U256;
 use crate::crypto::{PublicKey, Signature};
 use crate::error::{BtcError, Result};
 use crate::sha256::Hash;
 use crate::util::MerkleRoot;
+use bigdecimal::BigDecimal;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Blockchain {
-    pub utxos: HashMap<Hash, TransactionOutput>,
-    pub blocks: Vec<Block>,
+    utxos: HashMap<Hash, (bool, TransactionOutput)>,
+    blocks: Vec<Block>,
+    target: U256,
+    #[serde(default, skip_serializing)]
+    mempool: Vec<Transaction>,
 }
 
 impl Blockchain {
@@ -17,6 +22,8 @@ impl Blockchain {
         Blockchain {
             utxos: HashMap::new(),
             blocks: vec![],
+            target: U256,
+            mempool: vec![],
         }
     }
     pub fn add_block(&mut self, block: Block) -> Result<()> {
@@ -43,10 +50,57 @@ impl Blockchain {
             if block.header.timestamp <= last_block.header.timestamp {
                 return Err(BtcError::InvalidBlock);
             }
-            block.verify_transactions(self.block_height(), &self.utxos)
+            block.verify_transactions(self.block_height(), &self.utxos)?;
         }
+        let block_transactions: HashSet<_> =
+            block.transactions.iter().map(|tx| tx.hash()).collect();
+        self.mempool
+            .retain(|(_, tx)| !block_transactions.contains(&tx.hash()));
+        self.blocks.push(block);
+        self.try_adjust_target();
         self.blocks.push(block);
         Ok(())
+    }
+
+    pub fn try_adjust_target(&mut self) {
+        if self.blocks.is_empty() {
+            return;
+        }
+        if self.blocks.len() % crate::DIFFICULTY_UPDATE_INTERVAL as usize != 0 {
+            return;
+        }
+        let start_time = self.blocks
+            [self.blocks.len() - crate::DIFFICULTY_UPDATE_INTERVAL as usize]
+            .header
+            .timestamp;
+        let end_time = self.blocks.last().unwrap().header.timestamp;
+        let time_diff = end_time - start_time;
+
+        let time_diff_seconds = time_diff.num_seconds();
+        let target_seconds = crate::IDEAL_BLOCK_TIME * crate::DIFFICULTY_UPDATE_INTERVAL;
+        let new_target = BigDecimal::parse_bytes(&self.target.to_string().as_bytes(), 10)
+            .expect("BUG: impossible")
+            * (BigDecimal::from(time_diff_seconds) / BigDecimal::from(target_seconds));
+
+        let new_target_str = new_target
+            .to_string()
+            .split('.')
+            .next()
+            .expect("BUG: Expected a decimal point")
+            .to_owned();
+
+        let new_target: U256 = U256::from_str_radix(&new_target_str, 10).expect("BUG: impossible");
+
+        // let new_target = self.target * (time_diff_seconds as f64 / target_seconds as f64) as usize;
+
+        let new_target = if new_target < self.target / 4 {
+            self.target / 4
+        } else if new_target > self.target * 4 {
+            self.target * 4
+        } else {
+            new_target
+        };
+        self.target = new_target.min(crate::MIN_TARGET);
     }
     pub fn rebuild_utxos(&mut self) {
         for block in &self.blocks {
@@ -59,6 +113,69 @@ impl Blockchain {
                 }
             }
         }
+    }
+    pub fn block_height(&self) -> u64 {
+        self.blocks.len() as u64
+    }
+    pub fn utxos(&self) -> &HashMap<Hash, (bool, TransactionOutput)> {
+        &self.utxos
+    }
+    pub fn target(&self) -> U256 {
+        self.target
+    }
+    pub fn blocks(&self) -> impl Iterator<Item = &Block> {
+        self.blocks.iter()
+    }
+    pub fn mempool(&self) -> &[Transaction] {
+        &self.mempool
+    }
+    pub fn add_to_mempool(&mut self, transaction: Transaction) -> Result<()> {
+        // validate the transaction before insertion
+        let mut known_inputs = HashSet::new();
+        for input in &transaction.inputs {
+            if !self.utxos.contains_key(&input.prev_transaction_output_hash) {
+                return Err(BtcError::InvalidTransaction);
+            }
+            if known_inputs.contains(&input.prev_transaction_output_hash) {
+                return Err(BtcError::InvalidTransaction);
+            }
+            known_inputs.insert(input.prev_transaction_output_hash);
+        }
+        // all inputs must be lower than all outputs
+        let all_inputs = transaction
+            .inputs
+            .iter()
+            .map(|input| {
+                self.utxos
+                    .get(&input.prev_transaction_output_hash)
+                    .expect("BUG: impossible")
+                    .1
+                    .value
+            })
+            .sum::<u64>();
+        let all_outputs = transaction.outputs.iter().map(|output| output.value).sum();
+        if all_inputs < all_outputs {
+            return Err(BtcError::InvalidTransaction);
+        }
+        self.mempool.push(transaction);
+
+        self.mempool.sort_by_key(|transaction| {
+            let all_inputs = transaction
+                .inputs
+                .iter()
+                .map(|input| {
+                    self.utxos
+                        .get(&input.prev_transaction_output_hash)
+                        .expect("Bug: impossible")
+                        .1
+                        .value
+                })
+                .sum::<u64>();
+            let all_outputs: u64 = transaction.outputs.iter().map(|output| output.value).sum();
+            let miner_fee = all_inputs - all_outputs;
+            miner_fee
+        });
+        Ok(())
     }
 }
 
@@ -81,7 +198,7 @@ impl Block {
     pub fn verify_transactions(
         &self,
         predicted_block_height: u64,
-        utxos: &HashMap<Hash, TransactionOutput>,
+        utxos: &HashMap<Hash, (bool, TransactionOutput)>,
     ) -> Result<()> {
         let mut inputs: HashMap<Hash, TransactionOutput> = HashMap::new();
         // reject completely empty blocks
@@ -94,14 +211,16 @@ impl Block {
             let mut input_value = 0;
             let mut output_value = 0;
             for input in transaction.inputs.iter().skip(1) {
-                let prev_output = utxos.get(&input.prev_transaction_output_hash);
+                let prev_output = utxos
+                    .get(&input.prev_transaction_output_hash)
+                    .map(|(_, output)| output);
                 if prev_output.is_none() {
                     return Err(BtcError::InvalidTransaction);
                 }
 
                 let prev_output = prev_output.unwrap();
                 // prevent same block double spending
-                if input.contains_key(&input.prev_transaction_output_hash) {
+                if inputs.contains_key(&input.prev_transaction_output_hash) {
                     return Err(BtcError::InvalidTransaction);
                 }
                 //check if the signature is valid
@@ -111,6 +230,8 @@ impl Block {
                 {
                     return Err(BtcError::InvalidSignature);
                 }
+                input_value += prev_output.value;
+                inputs.insert(input.prev_transaction_output_hash, prev_output.clone());
             }
             for output in &transaction.outputs {
                 output_value += output.value;
@@ -121,10 +242,66 @@ impl Block {
         }
         Ok(())
     }
+    pub fn verify_coinbase_transaction(
+        &self,
+        predicted_block_height: u64,
+        utxos: &HashMap<Hash, (bool, TransactionOutput)>,
+    ) -> Result<()> {
+        let coinbase_transaction = &self.transactions[0];
+        if coinbase_transaction.inputs.len() != 0 {
+            return Err(BtcError::InvalidTransaction);
+        }
+        if coinbase_transaction.outputs.len() == 0 {
+            return Err(BtcError::InvalidTransaction);
+        }
+        let miner_fees = self.calculate_miner_fees(utxos)?;
+        let block_reward = crate::INITIAL_REWARD * 10u64.pow(8)
+            / 2u64.pow((predicted_block_height / crate::HALVING_INTERVAL) as u32);
+        let total_coinbase_outputs: u64 = coinbase_transaction
+            .outputs
+            .iter()
+            .map(|output| output.value)
+            .sum();
+        if total_coinbase_outputs != block_reward + miner_fees {
+            return Err(BtcError::InvalidTransaction);
+        }
+        Ok(())
+    }
+    pub fn calculate_miner_fees(
+        &self,
+        utxos: &HashMap<Hash, (bool, TransactionOutput)>,
+    ) -> Result<u64> {
+        let mut inputs: HashMap<Hash, TransactionOutput> = HashMap::new();
+        let mut outputs: HashMap<Hash, TransactionOutput> = HashMap::new();
+
+        for transaction in self.transactions.iter().skip(1) {
+            for input in &transaction.inputs {
+                let prev_output = utxos
+                    .get(&input.prev_transaction_output_hash)
+                    .map(|(_, output)| output);
+                if prev_output.is_none() {
+                    return Err(BtcError::InvalidTransaction);
+                }
+                let prev_output = prev_output.unwrap();
+                if inputs.contains_key(&input.prev_transaction_output_hash) {
+                    return Err(BtcError::InvalidTransaction);
+                }
+                inputs.insert(input.prev_transaction_output_hash, prev_output.clone());
+            }
+            for output in &transaction.outputs {
+                if outputs.contains_key(&output.hash()) {
+                    return Err(BtcError::InvalidTransaction);
+                }
+                outputs.insert(output.hash(), output.clone());
+            }
+        }
+        let input_value: u64 = inputs.values().map(|output| output.value).sum();
+
+        let output_value: u64 = outputs.values().map(|output| output.value).sum();
+
+        Ok(input_value - output_value)
+    }
 }
-
-use crate::U256;
-
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct BlockHeader {
     /// Timestamp of the block
@@ -157,6 +334,23 @@ impl BlockHeader {
     }
     pub fn hash(&self) -> Hash {
         Hash::hash(self)
+    }
+    pub fn mine(&mut self, steps: usize) -> bool {
+        if self.hash().matches_target(self.target) {
+            return true;
+        }
+        for _ in 0..steps {
+            if let Some(new_nonce) = self.nonce.checked_add(1) {
+                self.nonce = new_nonce;
+            } else {
+                self.nonce = 0;
+                self.timestamp = Utc::now();
+            }
+            if self.hash().matches_target(self.target) {
+                return true;
+            }
+        }
+        false
     }
 }
 
